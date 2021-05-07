@@ -8,6 +8,12 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+inputFiles/
+outputFiles/
+inference.txt
+fce.out
+allennlp/
+data/
 build/
 develop-eggs/
 dist/
