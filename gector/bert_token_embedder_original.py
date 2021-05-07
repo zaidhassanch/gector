@@ -1,14 +1,22 @@
-"""Tweaked version of corresponding AllenNLP file"""
-import logging
-from copy import deepcopy
+"""
+A ``TokenEmbedder`` which uses one of the BERT models
+(https://github.com/google-research/bert)
+to produce embeddings.
+At its core it uses Hugging Face's PyTorch implementation
+(https://github.com/huggingface/pytorch-pretrained-BERT),
+so thanks to them!
+"""
 from typing import Dict
-import os
+import logging
 
 import torch
 import torch.nn.functional as F
+
+from pytorch_pretrained_bert.modeling import BertModel
+
+from allennlp.modules.scalar_mix import ScalarMix
 from allennlp.modules.token_embedders.token_embedder import TokenEmbedder
 from allennlp.nn import util
-from transformers import AutoModel, PreTrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -19,21 +27,14 @@ class PretrainedBertModel:
     (e.g. to use as a token embedder and also as a pooling layer).
     This factory provides a cache so that you don't actually have to load the model twice.
     """
-
-    _cache: Dict[str, PreTrainedModel] = {}
+    _cache: Dict[str, BertModel] = {}
 
     @classmethod
-    def load(cls, model_name: str, cache_model: bool = True, save_dir = "pretrained_models/") -> PreTrainedModel:
+    def load(cls, model_name: str, cache_model: bool = True) -> BertModel:
         if model_name in cls._cache:
             return PretrainedBertModel._cache[model_name]
 
-        #AutoModel.save_pretrained
-        model_dir = save_dir + model_name + "/"
-        if os.path.isdir(model_dir):
-            model = AutoModel.from_pretrained(model_dir)
-        else: #download css
-            model = AutoModel.from_pretrained(model_name)
-            model.save_pretrained(save_dir)
+        model = BertModel.from_pretrained(model_name)
         if cache_model:
             cls._cache[model_name] = model
 
@@ -62,42 +63,33 @@ class BertEmbedder(TokenEmbedder):
         The number of starting special tokens input to BERT (usually 1, i.e., [CLS])
     num_end_tokens : int, optional (default: 1)
         The number of ending tokens input to BERT (usually 1, i.e., [SEP])
-    scalar_mix_parameters: ``List[float]``, optional, (default = None)
-        If not ``None``, use these scalar mix parameters to weight the representations
-        produced by different layers. These mixing weights are not updated during
-        training.
     """
-
-    def __init__(
-        self,
-        bert_model: PreTrainedModel,
-        top_layer_only: bool = False,
-        max_pieces: int = 512,
-        num_start_tokens: int = 1,
-        num_end_tokens: int = 1
-    ) -> None:
+    def __init__(self,
+                 bert_model: BertModel,
+                 top_layer_only: bool = False,
+                 max_pieces: int = 512,
+                 num_start_tokens: int = 1,
+                 num_end_tokens: int = 1) -> None:
         super().__init__()
-        # self.bert_model = bert_model
-        self.bert_model = deepcopy(bert_model)
+        self.bert_model = bert_model
         self.output_dim = bert_model.config.hidden_size
         self.max_pieces = max_pieces
         self.num_start_tokens = num_start_tokens
         self.num_end_tokens = num_end_tokens
-        self._scalar_mix = None
 
-    def set_weights(self, freeze):
-        for param in self.bert_model.parameters():
-            param.requires_grad = not freeze
-        return
+        if not top_layer_only:
+            self._scalar_mix = ScalarMix(bert_model.config.num_hidden_layers,
+                                         do_layer_norm=False)
+        else:
+            self._scalar_mix = None
 
     def get_output_dim(self) -> int:
         return self.output_dim
 
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        offsets: torch.LongTensor = None
-    ) -> torch.Tensor:
+    def forward(self,
+                input_ids: torch.LongTensor,
+                offsets: torch.LongTensor = None,
+                token_type_ids: torch.LongTensor = None) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -117,8 +109,13 @@ class BertEmbedder(TokenEmbedder):
             embeddings at those positions, and (in particular) will contain one embedding
             per token. If offsets are not provided, the entire tensor of wordpiece embeddings
             will be returned.
+        token_type_ids : ``torch.LongTensor``, optional
+            If an input consists of two sentences (as in the BERT paper),
+            tokens from the first sentence should have type 0 and tokens from
+            the second sentence should have type 1.  If you don't provide this
+            (the default BertIndexer doesn't) then it's assumed to be all 0s.
         """
-
+        # pylint: disable=arguments-differ
         batch_size, full_seq_len = input_ids.size(0), input_ids.size(-1)
         initial_dims = list(input_ids.shape[:-1])
 
@@ -145,17 +142,17 @@ class BertEmbedder(TokenEmbedder):
             # Now combine the sequences along the batch dimension
             input_ids = torch.cat(split_input_ids, dim=0)
 
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(input_ids)
+
         input_mask = (input_ids != 0).long()
+
         # input_ids may have extra dimensions, so we reshape down to 2-d
         # before calling the BERT model and then reshape back at the end.
-        all_encoder_layers = self.bert_model(
-            input_ids=util.combine_initial_dims(input_ids),
-            attention_mask=util.combine_initial_dims(input_mask),
-        )[0]
-        if len(all_encoder_layers[0].shape) == 3:
-            all_encoder_layers = torch.stack(all_encoder_layers)
-        elif len(all_encoder_layers[0].shape) == 2:
-            all_encoder_layers = torch.unsqueeze(all_encoder_layers, dim=0)
+        all_encoder_layers, _ = self.bert_model(input_ids=util.combine_initial_dims(input_ids),
+                                                token_type_ids=util.combine_initial_dims(token_type_ids),
+                                                attention_mask=util.combine_initial_dims(input_mask))
+        all_encoder_layers = torch.stack(all_encoder_layers)
 
         if needs_split:
             # First, unpack the output embeddings into one long sequence again
@@ -177,11 +174,8 @@ class BertEmbedder(TokenEmbedder):
 
             first_window = list(range(stride_offset))
 
-            max_context_windows = [
-                i
-                for i in range(full_seq_len)
-                if stride_offset - 1 < i % self.max_pieces < stride_offset + stride
-            ]
+            max_context_windows = [i for i in range(full_seq_len)
+                                   if stride_offset - 1 < i % self.max_pieces < stride_offset + stride]
 
             # Lookback what's left, unless it's the whole self.max_pieces window
             if full_seq_len % self.max_pieces == 0:
@@ -220,18 +214,17 @@ class BertEmbedder(TokenEmbedder):
             # offsets is (batch_size, d1, ..., dn, orig_sequence_length)
             offsets2d = util.combine_initial_dims(offsets)
             # now offsets is (batch_size * d1 * ... * dn, orig_sequence_length)
-            range_vector = util.get_range_vector(
-                offsets2d.size(0), device=util.get_device_of(mix)
-            ).unsqueeze(1)
+            range_vector = util.get_range_vector(offsets2d.size(0),
+                                                 device=util.get_device_of(mix)).unsqueeze(1)
             # selected embeddings is also (batch_size * d1 * ... * dn, orig_sequence_length)
             selected_embeddings = mix[range_vector, offsets2d]
 
             return util.uncombine_initial_dims(selected_embeddings, offsets.size())
 
 
-# @TokenEmbedder.register("bert-pretrained")
+@TokenEmbedder.register("bert-pretrained")
 class PretrainedBertEmbedder(BertEmbedder):
-
+    # pylint: disable=line-too-long
     """
     Parameters
     ----------
@@ -245,33 +238,11 @@ class PretrainedBertEmbedder(BertEmbedder):
         If True, compute gradient of BERT parameters for fine tuning.
     top_layer_only: ``bool``, optional (default = ``False``)
         If ``True``, then only return the top layer instead of apply the scalar mix.
-    scalar_mix_parameters: ``List[float]``, optional, (default = None)
-        If not ``None``, use these scalar mix parameters to weight the representations
-        produced by different layers. These mixing weights are not updated during
-        training.
     """
-
-    def __init__(
-        self,
-        pretrained_model: str,
-        requires_grad: bool = False,
-        top_layer_only: bool = False,
-        special_tokens_fix: int = 0,
-    ) -> None:
+    def __init__(self, pretrained_model: str, requires_grad: bool = False, top_layer_only: bool = False) -> None:
         model = PretrainedBertModel.load(pretrained_model)
 
         for param in model.parameters():
             param.requires_grad = requires_grad
 
-        super().__init__(
-            bert_model=model,
-            top_layer_only=top_layer_only
-        )
-
-        if special_tokens_fix:
-            try:
-                vocab_size = self.bert_model.embeddings.word_embeddings.num_embeddings
-            except AttributeError:
-                # reserve more space
-                vocab_size = self.bert_model.word_embedding.num_embeddings + 5
-            self.bert_model.resize_token_embeddings(vocab_size + 1)
+        super().__init__(bert_model=model, top_layer_only=top_layer_only)

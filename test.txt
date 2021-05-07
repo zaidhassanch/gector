@@ -1,0 +1,20 @@
+
+
+
+ Q = Decoder state
+ K, V = Encoder state
+
+ English to German
+ 5 words     6 words
+ vector size 512
+
+ Q ~ 6 x 512
+ K ~ 5 x 512 ~ V
+
+ softmax(QKt)xV
+
+ (6x512 x 512x5) 5x512
+    6 x 5 x 512 x 2
+
+  6x5 x 5x512
+  6x512

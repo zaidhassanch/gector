@@ -201,6 +201,7 @@ class GecBERTModel(object):
             batch = []
             for sequence in token_batch:
                 tokens = sequence[:max_len]
+                a = Token(tokens[0])
                 tokens = [Token(token) for token in ['$START'] + tokens]
                 batch.append(Instance({'tokens': TextField(tokens, indexer)}))
             batch = Batch(batch)
@@ -285,7 +286,7 @@ class GecBERTModel(object):
             all_results.append(get_target_sent_by_edits(tokens, edits))
         return all_results
 
-    def handle_batch(self, full_batch):
+    def handle_batch(self, full_batch, count, batch_size_basic):
         """
         Handle batch of requests.
         """
@@ -306,6 +307,11 @@ class GecBERTModel(object):
                 break
             probabilities, idxs, error_probs = self.predict(sequences)
 
+            # self.writeLabels(count, batch_size_basic, pred_ids, orig_batch, probabilities,
+            #                                     idxs, error_probs)
+            # for id , idxs_sent in zip(pred_ids, idxs):
+
+
             pred_batch = self.postprocess_batch(orig_batch, probabilities,
                                                 idxs, error_probs)
             if self.log:
@@ -320,3 +326,58 @@ class GecBERTModel(object):
                 break
 
         return final_batch, total_updates
+
+    def writeLabels(self, count, batch_size, pred_ids, batch, all_probabilities, all_idxs,
+                          error_probs,
+                          max_len=50):
+        all_results = []
+        noop_index = self.vocab.get_token_index("$KEEP", "labels")
+
+        for tokens, probabilities, idxs, error_prob, pred_id in zip(batch,
+                                                           all_probabilities,
+                                                           all_idxs,
+                                                           error_probs, pred_ids):
+            length = min(len(tokens), max_len)
+            edits = []
+
+            #>>>>>>>>>>>>>>>>>>>
+            fa = open("outputFiles/fce-predictions.txt", "a")
+            fa.write(str(count * batch_size + pred_id) + ": ")
+            for idx in idxs[:length+1]:
+                fa.write(str(idx) + ",")
+            fa.write("\n")
+
+            # print(tokens, len(idxs[:length+1]))
+
+            #<<<<<<<<<<<<<<<<<<<
+
+            # skip whole sentences if there no errors
+            if max(idxs) == 0:
+                all_results.append(tokens)
+                continue
+
+            # skip whole sentence if probability of correctness is not high
+            if error_prob < self.min_error_probability:
+                all_results.append(tokens)
+                continue
+
+            for i in range(length + 1):
+                # because of START token
+                if i == 0:
+                    token = START_TOKEN
+                else:
+                    token = tokens[i - 1]
+                # skip if there is no error
+                if idxs[i] == noop_index:
+                    continue
+
+                sugg_token = self.vocab.get_token_from_index(idxs[i],
+                                                             namespace='labels')
+                action = self.get_token_action(token, i, probabilities[i],
+                                               sugg_token)
+                if not action:
+                    continue
+
+                edits.append(action)
+            all_results.append(get_target_sent_by_edits(tokens, edits))
+        return all_results
